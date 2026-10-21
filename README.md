@@ -25,7 +25,7 @@ Plus tested blocking rules for Apache/LiteSpeed, Nginx, Caddy, HAProxy and ModSe
 ## Quick start
 
 ```bash
-git clone https://github.com/OWNER/php2shell-guard && cd php2shell-guard
+git clone https://github.com/Blue-B/php2shell-guard && cd php2shell-guard
 sudo ./guard.sh scan
 ```
 
