@@ -15,12 +15,13 @@ Plus tested blocking rules for Apache/LiteSpeed, Nginx, Caddy, HAProxy and ModSe
 
 > **Patching PHP is the fix.** Everything here is a stopgap for the hours or days before you can patch, or for end-of-life PHP that will never get a fix. Nothing here contains or links exploit code.
 
-## Status (updated 2026-10-21 07:00 UTC)
+## Status (updated 2026-10-21 08:00 UTC)
 
 - PHP's emergency release is scheduled for **21 October 2026, 14:00 UTC** ([php.net](https://www.php.net/archive/2026.php#2026-10-20-1)). Affected and fixed versions are not public yet.
 - Leaked material credits an exploit tool claiming PHP 5.4+ ([Sansec](https://sansec.io/research/php2shell)). Not confirmed by PHP.
 - Researchers point at a memory-safety bug in **session upload-progress handling while PHP parses `multipart/form-data` POST bodies**, before your application code runs ([Syhunt](https://github.com/syhunt/php2shell-protection)). Also not confirmed. The rules here target that path and will be revised once the advisory is out.
 - PHP 8.1 and older are end-of-life and will not get an official fix.
+- No in-the-wild exploitation reported yet ([watchTowr](https://watchtowr.com/intelligence/php-cve-2026-109618-faq/)). Unverified "PoC" repositories are already circulating: don't run exploit code you can't audit, fake PoCs that drop malware are common after big disclosures.
 
 ## Quick start
 
