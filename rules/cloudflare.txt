@@ -1,0 +1,11 @@
+php2shell-guard: Cloudflare WAF custom rule
+(Security > WAF > Custom rules > Create rule > Edit expression, action: Block)
+
+Expression:
+(http.request.method eq "POST" and any(lower(http.request.headers["content-type"][*])[*] contains "multipart/form-data"))
+
+To keep one upload path (it stays exposed), append:
+ and not http.request.uri.path eq "/upload.php"
+
+NOT TESTED in this repo's test suite (needs a Cloudflare zone). Use "Test rule"/Log action first.
+Only protects traffic that goes through Cloudflare: block direct-to-origin access too.

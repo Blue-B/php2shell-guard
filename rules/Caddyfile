@@ -1,0 +1,7 @@
+# php2shell-guard: reject multipart/form-data POST before php_fastcgi.
+# Paste inside your site block. `respond` runs before `php_fastcgi` in Caddy's directive order.
+@p2sg_multipart {
+	method POST
+	header_regexp Content-Type (?i)^\s*multipart/form-data([;,\s]|$)
+}
+respond @p2sg_multipart 403
