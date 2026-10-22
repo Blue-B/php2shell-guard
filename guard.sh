@@ -3,13 +3,11 @@
 # Read-only except `webcheck`, which copies check.php into a webroot you name.
 set -uo pipefail
 
-VERSION=0.1.0
+VERSION=0.2.0
 CVES="CVE-2026-109618|CVE-2026-109619"
-RELEASE_DATE="2026-10-21"   # PHP emergency release day; any later upstream release in a branch includes the fix
 
-# First upstream release of each branch with the fix. Empty = not published yet,
-# then `scan` asks php.net (skip with --offline). Keep in sync with check.php.
-declare -A FIXED=([8.2]="" [8.3]="" [8.4]="" [8.5]="")
+# First upstream release of each branch with the fix (PHP, 21 Oct 2026). Keep in sync with check.php.
+declare -A FIXED=([8.2]=8.2.35 [8.3]=8.3.36 [8.4]=8.4.27 [8.5]=8.5.12)
 
 if [[ -t 1 ]]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' B=$'\e[1m' N=$'\e[0m'; else R="" G="" Y="" B="" N=""; fi
 bad()  { echo "  ${R}[!!]${N} $*"; FOUND=1; }
@@ -22,13 +20,14 @@ usage() {
 cat <<EOF
 php2shell-guard $VERSION  -  checks for CVE-2026-109618 / CVE-2026-109619
 
-  guard.sh scan [--offline]          find every PHP binary/container, verdict per version,
-                                     distro backport check, upload_progress settings
+  guard.sh scan                      find every PHP binary/container, verdict per version,
+                                     distro backport check, stopgap settings, rlimits
   guard.sh test URL [URL...]         send harmless POST variants, verify your edge rule
                                      blocks multipart before PHP (best with check.php?probe=1)
   guard.sh hunt [WEBROOT...] [--days N]
                                      look for signs of compromise: shells spawned by PHP,
-                                     worker crashes, new PHP files, webshell patterns, cron
+                                     worker crashes, pre-script OOM, new PHP files, webshell
+                                     patterns, cron (default: back to 2026-10-17)
   guard.sh webcheck WEBROOT          copy check.php with a random key, print the URL
 
 Exit code 1 when something needs attention.
@@ -37,37 +36,35 @@ EOF
 
 # ---------- versions ----------
 
-declare -A ONLINE=()
-online_fixed() { # branch -> prints fixed version if php.net has a release on/after RELEASE_DATE
-    local br=$1 json ver date d m y pre months=JanFebMarAprMayJunJulAugSepOctNovDec
-    json=$(curl -fsS --max-time 10 "https://www.php.net/releases/index.php?json&version=$br" 2>/dev/null) || return 1
-    ver=$(grep -oE '"version":"[0-9.]+"' <<<"$json" | tail -1 | cut -d'"' -f4)
-    date=$(grep -oE '"date":"[^"]+"' <<<"$json" | head -1 | cut -d'"' -f4)   # "21 Oct 2026"
-    read -r d m y <<<"$date"; pre=${months%%"$m"*}
-    [[ -n $ver && -n $y && ${#pre} -lt 36 ]] || return 1
-    printf -v date '%04d-%02d-%02d' "$y" $(( ${#pre} / 3 + 1 )) "$((10#$d))"
-    # shortcut: uses the latest release, so a later bugfix release raises the bar; that only errs on the safe side.
-    [[ $date < $RELEASE_DATE ]] || echo "$ver"
-}
-
-verdict() { # version -> one line verdict, sets FOUND on bad
+verdict() { # version -> one line verdict, sets FOUND and returns 1 unless patched
     local v=$1 br=${1%.*} fx
     fx=${FIXED[$br]-}
-    if [[ -z ${FIXED[$br]+x} ]]; then
-        bad "PHP $v: branch $br is end-of-life, no official fix expected. Upgrade or take it off the internet."; return
-    fi
-    if [[ -z $fx && $OFFLINE == 0 ]]; then
-        [[ -n ${ONLINE[$br]+x} ]] || ONLINE[$br]=$(online_fixed "$br" || echo "?")
-        fx=${ONLINE[$br]}
-        [[ $fx == "?" ]] && { warn "PHP $v: could not reach php.net; fixed version unknown. Treat as vulnerable."; FOUND=1; return; }
-    fi
     if [[ -z $fx ]]; then
-        bad "PHP $v: fix not released yet for $br. Use the edge rules in rules/ until it is."
-    elif [[ $(printf '%s\n%s\n' "$fx" "$v" | sort -V | head -1) == "$fx" ]]; then
+        case $br in
+            7.4|8.0|8.1) bad "PHP $v: branch $br is end-of-life, no official release. Fixed only by a vendor/LTS package (see below) or PHP's source backport. Upgrade if you can." ;;
+            *) bad "PHP $v: branch $br is end-of-life, no fix from PHP. Upgrade or take it off the internet." ;;
+        esac
+        return 1
+    fi
+    if [[ $(printf '%s\n%s\n' "$fx" "$v" | sort -V | head -1) == "$fx" ]]; then
         ok "PHP $v: at or above first fixed release $fx"
     else
-        bad "PHP $v: below fixed release $fx (unless your distro backported it, see below)"
+        bad "PHP $v: below fixed release $fx (unless your distro backported it, see below)"; return 1
     fi
+}
+
+stopgaps() { # binary -> PHP's interim settings as its default ini has them (pools and vhosts can override)
+    [[ $1 == *cgi* ]] && return   # php-cgi -i prints HTML
+    local info k val msg="" risky=0
+    info=$("$1" -i 2>/dev/null)
+    for k in session.upload_progress.enabled memory_limit fatal_error_backtraces; do
+        val=$(awk -F' => ' -v k="$k" '$1 == k {print $NF; exit}' <<<"$info")
+        [[ -n $val ]] || continue
+        msg+=" $k=$val"
+        case $k=${val,,} in memory_limit=-1|*=off|*=0) ;; *) risky=1 ;; esac
+    done
+    [[ -n $msg ]] || return
+    if [[ $risky == 1 ]]; then warn "stopgaps not set in the default ini:$msg (see rules/php.ini)"; else ok "default ini has the stopgaps:$msg"; fi
 }
 
 php_bins() {
@@ -91,13 +88,12 @@ php_bins() {
 bin_version() { "$1" -v 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
 
 cmd_scan() {
-    OFFLINE=0; [[ ${1:-} == --offline ]] && OFFLINE=1
     hdr "PHP binaries on this host"
     local b v any=0
     while read -r b; do
         [[ -n $b ]] || continue
         v=$(bin_version "$b"); [[ -n $v ]] || continue
-        any=1; echo "  $b"; verdict "$v"
+        any=1; echo "  $b"; verdict "$v" || stopgaps "$b"
     done < <(php_bins)
     [[ $any == 1 ]] || warn "no PHP binary found in PATH or common panel paths (mod_php only? use check.php)"
 
@@ -126,17 +122,21 @@ cmd_scan() {
     fi
     [[ $hit == 1 ]] || echo "  no Debian/RPM PHP packages found (source build, panel or container: version check above applies)"
 
-    hdr "session.upload_progress.enabled (reported attack path, not an official root cause)"
-    while read -r b; do
-        [[ -n $b ]] || continue
-        v=$("$b" -i 2>/dev/null | grep -m1 '^session.upload_progress.enabled' | awk -F'=> ' '{print $NF}')
-        [[ -n $v ]] || continue
-        if [[ ${v,,} == on ]]; then warn "$b: On (CLI/FPM default ini; web pools may override)"; else ok "$b: $v"; fi
-    done < <(php_bins | grep -v cgi)
+    hdr "Stopgap settings in config files (until patched: upload_progress Off, memory_limit -1, 8.5 fatal_error_backtraces Off)"
     local overrides
-    overrides=$(grep -rsniE 'session\.upload_progress\.enabled' /etc/php* /etc/opt /usr/local/etc /opt/cpanel/ea-php*/root/etc /etc/apache2 /etc/httpd 2>/dev/null | grep -v ':[[:space:]]*;' | head -20)
+    overrides=$(grep -rsniE 'session\.upload_progress\.enabled|memory_limit|fatal_error_backtraces' /etc/php* /etc/opt /usr/local/etc /opt/cpanel/ea-php*/root/etc /etc/apache2 /etc/httpd 2>/dev/null | grep -v ':[[:space:]]*;' | head -30)
     [[ -n $overrides ]] && { echo "  explicit settings found:"; sed 's/^/    /' <<<"$overrides"; }
     echo "  The web SAPI value is the one that counts: check it with check.php (guard.sh webcheck)."
+    echo "  On FPM/CGI/LSAPI, .user.ini and ini_set() apply too late to help; use php.ini, the pool or the vhost."
+
+    hdr "Address-space/data rlimits on PHP workers (PHP: do not use them, allocation failure hits the bug)"
+    local lims
+    lims=$(ps -eo pid=,comm= 2>/dev/null | while read -r pid comm; do
+        [[ $comm =~ ^(php-fpm.*|php-cgi.*|lsphp.*|httpd|apache2|frankenphp)$ ]] || continue
+        awk -v c="$comm" '/^Max (address space|data size)/ && $4 != "unlimited" {print "    " c ": " $2 " " $3 " limited to " $4 " bytes"}' "/proc/$pid/limits" 2>/dev/null
+    done | sort -u)
+    if [[ -n $lims ]]; then warn "set (use a cgroup/MemoryMax= cap instead of ulimit -v / RLIMIT_AS / RLIMIT_DATA):"; echo "$lims"
+    else ok "none on running PHP/web workers"; fi
 
     [[ $FOUND == 0 ]] && { echo; ok "nothing flagged"; }
     return $FOUND
@@ -205,7 +205,8 @@ cmd_test() {
 # ---------- hunt ----------
 
 cmd_hunt() {
-    local days=3 roots=() a
+    # Amazon saw exploitation from 2026-10-17, four days before disclosure: look back at least that far.
+    local days=$(( ($(date +%s) - $(date -d 2026-10-17 +%s)) / 86400 + 1 )) roots=() a
     while [[ $# -gt 0 ]]; do
         case $1 in --days) days=$2; shift 2 ;; *) roots+=("$1"); shift ;; esac
     done
@@ -239,16 +240,30 @@ cmd_hunt() {
     done
     [[ $n == 0 ]] && ok "none right now (one-shot view; for live monitoring see Neo23x0/process-watcher)"
 
-    hdr "PHP worker crashes (memory-corruption exploits often crash workers first)"
+    hdr "PHP worker crashes and out-of-memory before any script ran (how exploit attempts show up)"
     local logs=() l
-    for l in /var/log/php*fpm*.log /var/log/php-fpm/*.log /var/log/apache2/error.log* /var/log/httpd/error_log* /usr/local/apache/logs/error_log /usr/local/lsws/logs/error.log /var/log/nginx/error.log*; do
+    for l in /var/log/php*.log /var/log/php/*.log /var/log/php-fpm/*.log /var/log/apache2/error.log* /var/log/httpd/error_log* /usr/local/apache/logs/error_log /usr/local/lsws/logs/error.log /var/log/nginx/error.log*; do
         [[ -f $l ]] && logs+=("$l")
     done
-    local crashes=""
-    [[ ${#logs[@]} -gt 0 ]] && crashes=$(zgrep -hE 'SIGSEGV|SIGBUS|SIGABRT|signal 11|signal 6|signal 7|Segmentation fault|zend_mm_heap corrupted' "${logs[@]}" 2>/dev/null | tail -10)
-    command -v journalctl >/dev/null && crashes+=$(journalctl -q --no-pager --since "-${days} days" 2>/dev/null | grep -E '(php|httpd|apache2).*(SIGSEGV|signal 11|segfault|Segmentation fault)' | tail -10)
+    # CVE-2026-109618 needs an OOM while PHP parses the request: logged "in Unknown on line 0", and FPM then
+    # ends the child with exit code 70 (FPM_EXIT_SOFTWARE after a failed request startup).
+    local crash_re='SIGSEGV|SIGBUS|SIGABRT|signal 11|signal 6|signal 7|Segmentation fault|zend_mm_heap corrupted' oom_re='exhausted.* in Unknown on line 0|exited with code 70 after'
+    local crashes="" oom=""
+    if [[ ${#logs[@]} -gt 0 ]]; then
+        crashes=$(zgrep -hE "$crash_re" "${logs[@]}" 2>/dev/null | tail -10)
+        oom=$(zgrep -hE "$oom_re" "${logs[@]}" 2>/dev/null | tail -10)
+    fi
+    if command -v journalctl >/dev/null; then
+        local journal
+        journal=$(journalctl -q --no-pager --since "-${days} days" 2>/dev/null | grep -E 'php|httpd|apache2')
+        crashes+=$(grep -E 'SIGSEGV|signal 11|segfault|Segmentation fault' <<<"$journal" | tail -10)
+        oom+=$(grep -E "$oom_re" <<<"$journal" | tail -10)
+    fi
+    local where="${#logs[@]} log file(s)$(command -v journalctl >/dev/null && echo ' or journal')"
     if [[ -n $crashes ]]; then bad "crash lines found (last 10 per source):"; sed 's/^/      /' <<<"$crashes"
-    else ok "no crash lines in ${#logs[@]} log file(s)$(command -v journalctl >/dev/null && echo ' or journal')"; fi
+    else ok "no crash lines in $where"; fi
+    if [[ -n $oom ]]; then bad "out-of-memory during request startup (last 10 per source):"; sed 's/^/      /' <<<"$oom"
+    else ok "no pre-script out-of-memory lines in $where"; fi
 
     hdr "PHP files in temp dirs"
     local tmpphp

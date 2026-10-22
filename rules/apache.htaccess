@@ -3,6 +3,13 @@
 # Also works on LiteSpeed / OpenLiteSpeed, which read .htaccess rewrite rules.
 # WARNING: blocks every multipart form and file upload on the site. Use the allowlist line if you need some.
 RewriteEngine On
+# Chunked multipart has no Content-Length, so mod_php skips the post_max_size check (CVE-2026-109618).
+# Refused everywhere, allowlisted endpoints included.
+RewriteCond %{REQUEST_METHOD} ^POST$ [NC]
+RewriteCond %{HTTP:Content-Type} multipart/form-data [NC]
+RewriteCond %{HTTP:Transfer-Encoding} chunked [NC]
+RewriteRule ^ - [F,L]
+# Every other multipart POST:
 RewriteCond %{REQUEST_METHOD} ^POST$ [NC]
 RewriteCond %{HTTP:Content-Type} ^[[:space:]]*multipart/form-data([;,[:space:]]|$) [NC]
 # Allowlist an upload endpoint you trust (only if you must, it stays exposed):
