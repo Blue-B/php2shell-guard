@@ -47,12 +47,14 @@ $ sudo ./guard.sh scan
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: Blue-B/php2shell-guard@v0.4.0
+- uses: Blue-B/php2shell-guard@v0
   with:
     path: docker k8s
 ```
 
-Other CI: `git clone --depth 1 --branch v0.4.0 https://github.com/Blue-B/php2shell-guard /tmp/p2sg && /tmp/p2sg/guard.sh images .`
+Other CI: `git clone --depth 1 --branch v0 https://github.com/Blue-B/php2shell-guard /tmp/p2sg && /tmp/p2sg/guard.sh images .`
+
+`v0` always points to the latest 0.x release, so new fixes reach your CI without editing it. Pin an exact tag such as `v0.4.0` if you prefer.
 
 ## Compared with openai/php2shell-checker
 
