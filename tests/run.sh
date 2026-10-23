@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end tests: real Apache, Nginx, Caddy, HAProxy, ModSecurity in Docker, each in front of PHP.
-# Usage: tests/run.sh   (needs docker; uses ports 18081-18086; cleans up after itself)
+# Usage: tests/run.sh   (needs docker; uses ports 18081-18087; cleans up after itself)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -142,6 +142,114 @@ has "hunt: webshell pattern" 'webshell-like.*|/tmp/w/shell.php' "$out"
 
 out=$(docker exec -u root p2sg-apache bash -c 'mkdir -p /tmp/wr && /guard/guard.sh webcheck /tmp/wr && grep -c "^.KEY = .[0-9a-f]\{48\}.;" /tmp/wr/p2sg-*.php && grep -c "CHANGE_ME" /tmp/wr/p2sg-*.php')
 has "webcheck installs a random 48-hex key and keeps the placeholder guard" $'^1\n1$' "$(tail -2 <<<"$out")"
+
+echo; echo "== --json =="
+js() { docker exec -i p2sg-apache php -r '$j = json_decode(stream_get_contents(STDIN), true); if (!is_array($j)) { echo "INVALID"; exit; } echo $j["exit"], "\n"; foreach ($j["findings"] as $f) echo $f["level"], " ", str_replace("\n", " ", $f["message"]), "\n";'; }
+out=$(docker exec p2sg-apache bash /guard/guard.sh scan --json | js)
+has "scan --json is valid JSON with exit 1" '^1$' "$(head -1 <<<"$out")"
+has "scan --json carries the verdict" "^bad PHP $PHP_OLD: below fixed release $PHP_NEW" "$out"
+out=$(docker exec p2sg-apache bash /guard/guard.sh hunt /tmp/w --days 1 --json | js)
+has "hunt --json keeps the evidence lines" '^bad found: .*/tmp/x.php' "$out"
+
+echo; echo "== guard.sh images =="
+mkdir -p "$WORK/img/app" "$WORK/img/k8s" "$WORK/img/node_modules/x"
+printf 'FROM php:%s-fpm AS base\nFROM docker.io/library/php:%s-apache\nFROM php:8.2-fpm-alpine\nFROM php:7.4-apache\n' $PHP_OLD $PHP_NEW > "$WORK/img/app/Dockerfile"
+printf 'services:\n  web:\n    image: "bitnami/php-fpm:8.4.20-debian-12-r0"\n' > "$WORK/img/compose.yaml"
+printf -- '- image: myreg.io/team/php:%s\n' $PHP_NEW > "$WORK/img/k8s/dep.yml"
+echo 'FROM php:5.6' > "$WORK/img/node_modules/x/Dockerfile"
+out=$(./guard.sh images "$WORK/img"); rc=$?
+expect "images exits 1 on an old tag" 1 $rc
+has "images: pinned old tag" "PHP $PHP_OLD: below fixed release $PHP_NEW" "$out"
+has "images: registry path and fixed tag" "myreg.io/team/php:$PHP_NEW" "$out"
+has "images: moving tag is a warning" 'php:8.2-fpm-alpine: moving tag' "$out"
+has "images: EOL branch" 'php:7.4-apache: branch 7.4 is end-of-life' "$out"
+has "images: non-official php-fpm image" 'PHP 8.4.20: below fixed release 8.4.27' "$out"
+expect "images skips node_modules" 0 "$(grep -c 'php:5.6' <<<"$out")"
+printf 'FROM php:%s-cli\n' $PHP_NEW > "$WORK/img-ok"; mkdir -p "$WORK/img2"; mv "$WORK/img-ok" "$WORK/img2/Dockerfile"
+./guard.sh images "$WORK/img2" >/dev/null; expect "images exits 0 when every tag is fixed" 0 $?
+./guard.sh images "$WORK/no-such-dir" >/dev/null 2>&1; expect "images fails on a missing path" 2 $?
+# Alpine: busybox grep/find, and the oldest Bash we claim
+alp=$(docker run --rm -v "$ROOT:/guard:ro" -v "$WORK/img:/img:ro" bash:4.0 bash /guard/guard.sh images /img); rc=$?
+expect "images on busybox + Bash 4.0 finds the same tags" "$(grep -c '\[' <<<"$out")|1" "$(grep -c '\[' <<<"$alp")|$rc"
+docker run --rm -v "$ROOT:/guard:ro" bash:4.0 sh -c "mkdir -p /srv/w && echo '<?php eval(base64_decode(\$_POST[1]));' > /srv/w/s.php && bash /guard/guard.sh hunt /srv/w --days 1" > "$WORK/alp-hunt"
+has "hunt on busybox finds the webshell" '/srv/w/s.php' "$(cat "$WORK/alp-hunt")"
+
+echo; echo "== guard.sh fix / undo: official FPM image behind nginx =="
+run --name p2sg-fixfpm -v "$WORK/www:/var/www/html:ro" -v "$ROOT:/guard:ro" php:$PHP_OLD-fpm
+sed 's/p2sg-fpm:9000/p2sg-fixfpm:9000/' "$WORK/nginx-open.conf" > "$WORK/nginx-fix.conf"
+run --name p2sg-nginx-fix -p 18087:80 -v "$WORK/www:/var/www/html:ro" -v "$WORK/nginx-fix.conf:/etc/nginx/conf.d/default.conf:ro" nginx:alpine
+for _ in $(seq 60); do curl -s -o /dev/null "http://127.0.0.1:18087/check.php?probe=1" && break; sleep 1; done
+web() { curl -s "http://127.0.0.1:18087/check.php?key=$KEY"; }
+has "before fix: FPM serves upload_progress On" 'session.upload_progress.enabled +On' "$(web)"
+
+out=$(docker exec p2sg-fixfpm bash /guard/guard.sh fix); rc=$?
+expect "fix without --apply is a dry run (exit 1)" 1 $rc
+has "fix plans the ini drop-in" 'write /usr/local/etc/php/conf.d/99-php2shell-guard.ini' "$out"
+has "fix plans the pool drop-in for pool www" 'write /usr/local/etc/php-fpm.d/zz-php2shell-guard.conf \(pools: www\)' "$out"
+expect "dry run writes nothing" 0 "$(docker exec p2sg-fixfpm sh -c 'ls /usr/local/etc/php/conf.d/99-* /usr/local/etc/php-fpm.d/zz-php2* 2>/dev/null | wc -l')"
+out=$(docker exec -u www-data p2sg-fixfpm bash /guard/guard.sh fix --apply 2>&1); rc=$?
+expect "fix --apply refuses without root" 2 $rc
+
+# a fake apachectl that only fails once our file exists: the write must be rolled back
+docker exec p2sg-fixfpm sh -c 'printf "#!/bin/sh\n[ -f /usr/local/etc/php/conf.d/99-php2shell-guard.ini ] && { echo boom; exit 1; }\necho Syntax OK\n" > /usr/local/bin/apachectl && chmod +x /usr/local/bin/apachectl'
+out=$(docker exec p2sg-fixfpm bash /guard/guard.sh fix --apply); rc=$?
+expect "fix --apply rolls back when a config test changes" 1 $rc
+has "rollback says why" 'rolled back' "$out"
+expect "rollback leaves no drop-in behind" 0 "$(docker exec p2sg-fixfpm sh -c 'ls /usr/local/etc/php/conf.d/99-* /usr/local/etc/php-fpm.d/zz-php2* 2>/dev/null | wc -l')"
+docker exec p2sg-fixfpm rm /usr/local/bin/apachectl
+
+out=$(docker exec p2sg-fixfpm bash /guard/guard.sh fix --apply); rc=$?
+expect "fix --apply succeeds" 0 $rc
+has "fix --apply checks the config" 'config tests unchanged' "$out"
+has "fix --apply asks for a restart without systemd" 'restart every PHP worker' "$out"
+expect "CLI sees the stopgaps" '-1 0' "$(docker exec p2sg-fixfpm php -r 'echo ini_get("memory_limit"), " ", (int)ini_get("session.upload_progress.enabled");')"
+docker kill -s USR2 p2sg-fixfpm >/dev/null; sleep 2
+out=$(web)
+has "after fix + reload: FPM serves upload_progress Off" 'session.upload_progress.enabled +Off' "$out"
+has "after fix + reload: FPM serves memory_limit -1" 'memory_limit +-1$' "$out"
+expect "after fix: the memory_limit note is gone" 0 "$(grep -c 'memory_limit=-1 via' <<<"$out")"
+first=$(docker exec p2sg-fixfpm cat /usr/local/etc/php-fpm.d/zz-php2shell-guard.conf)
+docker exec p2sg-fixfpm bash /guard/guard.sh fix --apply >/dev/null; rc=$?
+expect "fix --apply twice is fine" 0 $rc
+expect "second run does not stack pool sections" "$first" "$(docker exec p2sg-fixfpm cat /usr/local/etc/php-fpm.d/zz-php2shell-guard.conf)"
+
+docker exec p2sg-fixfpm sh -c 'echo "memory_limit = 64M" > /usr/local/etc/php/conf.d/99-php2shell-guard.ini.keep'
+out=$(docker exec p2sg-fixfpm bash /guard/guard.sh undo); rc=$?
+expect "undo succeeds" 0 $rc
+has "undo removes the ini drop-in" 'removed /usr/local/etc/php/conf.d/99-php2shell-guard.ini' "$out"
+has "undo removes the pool drop-in" 'removed /usr/local/etc/php-fpm.d/zz-php2shell-guard.conf' "$out"
+expect "undo leaves other files alone" 1 "$(docker exec p2sg-fixfpm sh -c 'ls /usr/local/etc/php/conf.d/*.keep | wc -l')"
+docker exec p2sg-fixfpm sh -c 'printf "memory_limit = 64M\n" > /usr/local/etc/php/conf.d/99-php2shell-guard.ini'
+out=$(docker exec p2sg-fixfpm bash /guard/guard.sh undo)
+has "undo keeps a same-named file it did not write" 'nothing to remove' "$out"
+docker exec p2sg-fixfpm sh -c 'rm /usr/local/etc/php/conf.d/99-php2shell-guard.ini*'
+docker kill -s USR2 p2sg-fixfpm >/dev/null; sleep 2
+has "after undo + reload: FPM back to upload_progress On" 'session.upload_progress.enabled +On' "$(web)"
+
+out=$(docker run --rm -v "$ROOT:/guard:ro" php:$PHP_NEW-cli bash /guard/guard.sh fix --apply); rc=$?
+expect "fix on patched PHP $PHP_NEW does nothing" 0 $rc
+has "fix on patched PHP says so" 'no unpatched PHP binary found' "$out"
+
+echo; echo "== guard.sh fix / undo: Ubuntu packages (one conf.d per SAPI, distro backports) =="
+run --name p2sg-ubuntu -v "$ROOT:/guard:ro" ubuntu:24.04 sleep 600
+if docker exec -e DEBIAN_FRONTEND=noninteractive p2sg-ubuntu sh -c 'apt-get update -qq && apt-get install -y -qq php8.3-fpm libapache2-mod-php8.3' >/dev/null 2>&1; then
+    CL=/usr/share/doc/php8.3-common/changelog.Debian.gz
+    # pretend the package carries the fix, then that it does not
+    docker exec p2sg-ubuntu sh -c "{ echo '  * Fix CVE-2026-109618 and CVE-2026-109619'; zcat $CL; } | gzip > /tmp/cl && mv /tmp/cl $CL"
+    out=$(docker exec p2sg-ubuntu bash /guard/guard.sh fix --apply); rc=$?
+    expect "fix: a distro backport counts as patched" 0 $rc
+    has "fix: nothing to do on a backported package" 'no unpatched PHP binary found' "$out"
+    docker exec p2sg-ubuntu sh -c "zcat $CL | grep -v 'CVE-2026-10961[89]' | gzip > /tmp/cl && mv /tmp/cl $CL"
+    out=$(docker exec p2sg-ubuntu bash /guard/guard.sh fix --apply); rc=$?
+    expect "fix --apply on Ubuntu packages" 0 $rc
+    for s in cli fpm apache2; do has "fix writes the $s conf.d" "wrote /etc/php/8.3/$s/conf.d/99-php2shell-guard.ini" "$out"; done
+    has "fix writes the Ubuntu pool drop-in" 'wrote /etc/php/8.3/fpm/pool.d/zz-php2shell-guard.conf' "$out"
+    has "php-fpm8.3 accepts the pool drop-in" 'memory_limit.*-1' "$(docker exec p2sg-ubuntu php-fpm8.3 -tt 2>&1 | grep -i 'memory_limit')"
+    out=$(docker exec p2sg-ubuntu bash /guard/guard.sh undo)
+    expect "undo removes all four Ubuntu drop-ins" 4 "$(grep -c 'removed ' <<<"$out")"
+else
+    echo "FAIL  apt-get install php8.3-fpm in ubuntu:24.04 (network?)"; FAILS=$((FAILS+1))
+fi
 
 echo; [[ $FAILS == 0 ]] && echo "ALL PASSED" || echo "$FAILS FAILED"
 exit $((FAILS > 0))
