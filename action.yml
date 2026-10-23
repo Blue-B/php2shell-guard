@@ -1,0 +1,17 @@
+name: php2shell-guard images
+description: Fail CI on PHP image tags without the php2shell fix
+branding:
+  icon: shield
+  color: red
+inputs:
+  path:
+    description: Files or directories to check, separated by spaces
+    default: .
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        P2SG_PATH: ${{ inputs.path }}
+      # unquoted on purpose: several paths split on spaces
+      run: '"$GITHUB_ACTION_PATH/guard.sh" images $P2SG_PATH'

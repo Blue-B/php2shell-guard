@@ -4,8 +4,7 @@
 # (add or remove our own drop-in config files; existing files are never edited).
 set -uo pipefail
 
-VERSION=0.3.0
-CVES="CVE-2026-109618|CVE-2026-109619"
+VERSION=0.4.0
 
 # First upstream release of each branch with the fix (PHP, 21 Oct 2026). Keep in sync with check.php.
 declare -A FIXED=([8.2]=8.2.35 [8.3]=8.3.36 [8.4]=8.4.27 [8.5]=8.5.12)
@@ -44,7 +43,8 @@ cat <<EOF
 php2shell-guard $VERSION  -  checks for CVE-2026-109618 / CVE-2026-109619
 
   guard.sh scan                      find every PHP binary/container, verdict per version,
-                                     distro backport check, stopgap settings, rlimits
+                                     distro backport check, workers not restarted, stopgaps, rlimits
+  guard.sh check URL [URL...]        from outside: verdict from the PHP version a site advertises
   guard.sh test URL [URL...]         send harmless POST variants, verify your edge rule
                                      blocks multipart before PHP (best with check.php?probe=1)
   guard.sh hunt [WEBROOT...] [--days N]
@@ -57,7 +57,7 @@ php2shell-guard $VERSION  -  checks for CVE-2026-109618 / CVE-2026-109619
   guard.sh undo                      remove those drop-in files again (after patching)
   guard.sh images [DIR...]           PHP image tags in Dockerfiles/compose/Kubernetes files (CI gate)
 
-  --json                             scan, test, hunt, images: one JSON object on stdout
+  --json                             scan, check, test, hunt, images: one JSON object on stdout
 
 Exit code 1 when something needs attention.
 EOF
@@ -116,6 +116,22 @@ php_bins() {
 
 bin_version() { "$1" -v 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
 
+cves_named() { # changelog on stdin -> how many of the two CVEs it names (a package fixing one is still exposed)
+    local t n=0
+    t=$(cat)
+    [[ $t == *CVE-2026-109618* ]] && n=$((n+1))
+    [[ $t == *CVE-2026-109619* ]] && n=$((n+1))
+    echo $n
+}
+
+changelog_verdict() { # package count
+    case $2 in
+        2) ok "$1: changelog names both CVEs" ;;
+        1) warn "$1: changelog names only one of the two CVEs, not counted as fixed" ;;
+        *) warn "$1: no CVE in changelog yet" ;;
+    esac
+}
+
 cmd_scan() {
     hdr "PHP binaries on this host"
     local b v any=0
@@ -140,16 +156,29 @@ cmd_scan() {
     local f pkg hit=0
     for f in /usr/share/doc/php[0-9]*-common/changelog.Debian.gz; do   # other php8.x-* doc dirs symlink here
         [[ -f $f ]] || continue
-        if zgrep -qE "$CVES" "$f"; then ok "$(basename "$(dirname "$f")"): changelog mentions the CVEs"; else warn "$(basename "$(dirname "$f")"): no CVE in changelog yet"; fi
+        changelog_verdict "$(basename "$(dirname "$f")")" "$(zcat -f "$f" | cves_named)"
         hit=1
     done
     if command -v rpm >/dev/null; then
         while read -r pkg; do
-            if rpm -q --changelog "$pkg" 2>/dev/null | grep -qE "$CVES"; then ok "$pkg: changelog mentions the CVEs"; else warn "$pkg: no CVE in changelog yet"; fi
+            changelog_verdict "$pkg" "$(rpm -q --changelog "$pkg" 2>/dev/null | cves_named)"
             hit=1
         done < <(rpm -qa --qf '%{NAME}\n' 2>/dev/null | grep -E '^(ea-|alt-)?php[0-9]*(-php)?-common$' | sort -u)
     fi
     [[ $hit == 1 ]] || echo "  no Debian/RPM PHP packages found (source build, panel or container: version check above applies)"
+
+    hdr "PHP processes still running old code (updated on disk, not restarted)"
+    local stale note=""
+    [[ $EUID -ne 0 ]] && note=" (not root: only your own processes checked)"
+    # processes started before an upgrade keep the replaced binary or libphp.so, shown as "(deleted)"
+    stale=$(ps -eo pid=,comm= 2>/dev/null | while read -r pid comm; do
+        case $comm in
+            (php*|lsphp*|frankenphp) [[ $(readlink "/proc/$pid/exe" 2>/dev/null) == *' (deleted)' ]] && echo "$comm" ;;
+            (httpd|apache2) grep -qE '/libphp[^/]*\.so.* \(deleted\)$' "/proc/$pid/maps" 2>/dev/null && echo "$comm" ;;
+        esac
+    done | sort | uniq -c | awk '{print $2 ": " $1 " process(es)"}')
+    if [[ -n $stale ]]; then bad "restart these, they still run the PHP that was replaced on disk:"; detail "$stale"
+    else ok "none$note"; fi
 
     hdr "Stopgap settings in config files (until patched: upload_progress Off, memory_limit -1, 8.5 fatal_error_backtraces Off)"
     local overrides
@@ -168,6 +197,33 @@ cmd_scan() {
     else ok "none on running PHP/web workers"; fi
 
     [[ $FOUND == 0 ]] && { echo; ok "nothing flagged"; }
+    return $FOUND
+}
+
+# ---------- check ----------
+
+cmd_check() { # URL... -> verdict from the PHP version in X-Powered-By / Server
+    [[ $# -gt 0 ]] || { usage; return 2; }
+    local url h vs v base
+    for url in "$@"; do
+        hdr "$url"
+        # GET like a browser, body discarded, redirects followed (http -> https)
+        h=$(curl -sS -L --max-redirs 5 --max-time 15 -o /dev/null -D - "$url" 2>&1) || { warn "request failed: ${h##*$'\n'}"; continue; }
+        vs=$(grep -iE '^(x-powered-by|server):' <<<"$h" | grep -oiE 'PHP/[0-9]+\.[0-9]+\.[0-9]+[^[:space:],;]*' | cut -d/ -f2 | sort -u)
+        if [[ -z $vs ]]; then
+            warn "no PHP version in the headers (expose_php=Off, removed by a proxy, or not PHP): unknown, run guard.sh scan on the server"
+            continue
+        fi
+        for v in $vs; do
+            base=${v%%[-+~]*}
+            # Debian/Ubuntu builds advertise e.g. 8.2.7-1~deb12u1: the original release number, backports not visible
+            if [[ $base != "$v" ]] && ! (verdict "$base" >/dev/null); then
+                warn "PHP $v: distro build, the version number cannot show a backported fix: run guard.sh scan on the server"
+            else verdict "$base"; fi
+        done
+    done
+    echo
+    echo "  Headers only show what the site advertises. Only guard.sh scan on the server confirms a fix."
     return $FOUND
 }
 
@@ -344,10 +400,10 @@ cmd_webcheck() {
 
 INI_DROPIN=99-php2shell-guard.ini POOL_DROPIN=zz-php2shell-guard.conf MARK='; php2shell-guard drop-in'
 
-backported() { # binary -> 0 if its distro package's changelog names the CVEs (fixed without a version bump)
+backported() { # binary -> 0 if its distro package's changelog names both CVEs (fixed without a version bump)
     local p
-    if p=$(dpkg-query -S "$1" 2>/dev/null | head -1) && [[ -n $p ]]; then zgrep -qE "$CVES" "/usr/share/doc/${p%%:*}/changelog.Debian.gz" 2>/dev/null
-    elif p=$(rpm -qf "$1" 2>/dev/null) && [[ -n $p ]]; then rpm -q --changelog "$p" 2>/dev/null | grep -qE "$CVES"
+    if p=$(dpkg-query -S "$1" 2>/dev/null | head -1) && [[ -n $p ]]; then [[ $(zcat -f "/usr/share/doc/${p%%:*}/changelog.Debian.gz" 2>/dev/null | cves_named) == 2 ]]
+    elif p=$(rpm -qf "$1" 2>/dev/null) && [[ -n $p ]]; then [[ $(rpm -q --changelog "$p" 2>/dev/null | cves_named) == 2 ]]
     else return 1; fi
 }
 
@@ -509,11 +565,11 @@ for a in "$@"; do if [[ $a == --json ]]; then JSON=1; else args+=("$a"); fi; don
 set -- "${args[@]+"${args[@]}"}"
 cmd=${1:-}
 case $cmd in
-    scan|test|hunt|webcheck|fix|undo|images) shift ;;
+    scan|check|test|hunt|webcheck|fix|undo|images) shift ;;
     -v|--version) echo "$VERSION"; exit 0 ;;
     *) usage; [[ -z $cmd || $cmd == -h || $cmd == --help ]] && exit 0 || exit 2 ;;
 esac
-if [[ $JSON == 1 && $cmd =~ ^(scan|test|hunt|images)$ ]]; then
+if [[ $JSON == 1 && $cmd =~ ^(scan|check|test|hunt|images)$ ]]; then
     "cmd_$cmd" "$@" >/dev/null; rc=$?
     print_json "$cmd" "$rc"
     exit $rc

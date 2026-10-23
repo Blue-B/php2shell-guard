@@ -140,6 +140,26 @@ has "hunt: out-of-memory before any script ran" 'out-of-memory during request st
 has "hunt: PHP file in /tmp" '/tmp/x.php' "$out"
 has "hunt: webshell pattern" 'webshell-like.*|/tmp/w/shell.php' "$out"
 
+echo; echo "== guard.sh check (headers, from outside) and processes not restarted =="
+out=$(./guard.sh check "http://127.0.0.1:18081/check.php?probe=1"); rc=$?
+expect "check flags the advertised $PHP_OLD" 1 $rc
+has "check reads X-Powered-By" "PHP $PHP_OLD: below fixed release $PHP_NEW" "$out"
+out=$(./guard.sh check "http://127.0.0.1:18081/no-such.txt"); rc=$?
+expect "check without a PHP header is not a failure" 0 $rc
+has "check says unknown without a PHP header" 'no PHP version in the headers' "$out"
+out=$(./guard.sh check "http://127.0.0.1:1/"); rc=$?
+has "check reports a failed request" 'request failed: curl' "$out"
+docker exec p2sg-apache sh -c "echo '<?php header(\"X-Powered-By: PHP/8.1.2-1ubuntu2.20\");' > /tmp/distro.php"
+docker exec -d p2sg-apache php -S 127.0.0.1:9998 -t /tmp   # 9999 is still busy with spawn.php
+sleep 1; out=$(docker exec p2sg-apache bash /guard/guard.sh check http://127.0.0.1:9998/distro.php); rc=$?
+expect "check does not call an old-looking distro build vulnerable" 0 $rc
+has "check sends distro builds to scan" 'PHP 8.1.2-1ubuntu2.20: distro build' "$out"
+docker exec p2sg-apache sh -c 'mkdir -p /tmp/old && cp /usr/local/bin/php /tmp/old/php'
+docker exec -d p2sg-apache /tmp/old/php -r 'sleep(60);'
+sleep 1; docker exec p2sg-apache rm /tmp/old/php
+out=$(docker exec p2sg-apache bash /guard/guard.sh scan)
+has "scan flags a PHP process whose binary was replaced" 'php: 1 process' "$out"
+
 out=$(docker exec -u root p2sg-apache bash -c 'mkdir -p /tmp/wr && /guard/guard.sh webcheck /tmp/wr && grep -c "^.KEY = .[0-9a-f]\{48\}.;" /tmp/wr/p2sg-*.php && grep -c "CHANGE_ME" /tmp/wr/p2sg-*.php')
 has "webcheck installs a random 48-hex key and keeps the placeholder guard" $'^1\n1$' "$(tail -2 <<<"$out")"
 
@@ -234,6 +254,13 @@ echo; echo "== guard.sh fix / undo: Ubuntu packages (one conf.d per SAPI, distro
 run --name p2sg-ubuntu -v "$ROOT:/guard:ro" ubuntu:24.04 sleep 600
 if docker exec -e DEBIAN_FRONTEND=noninteractive p2sg-ubuntu sh -c 'apt-get update -qq && apt-get install -y -qq php8.3-fpm libapache2-mod-php8.3' >/dev/null 2>&1; then
     CL=/usr/share/doc/php8.3-common/changelog.Debian.gz
+    # a changelog naming only one CVE is not a fix
+    docker exec p2sg-ubuntu sh -c "cp $CL /tmp/cl.orig && zcat $CL | grep -v 'CVE-2026-10961[89]' | { echo '  * Fix CVE-2026-109618'; cat; } | gzip > /tmp/cl && mv /tmp/cl $CL"
+    out=$(docker exec p2sg-ubuntu bash /guard/guard.sh fix); rc=$?
+    expect "fix: one CVE in the changelog still needs stopgaps" 1 $rc
+    has "fix: plans drop-ins when only one CVE is fixed" 'write /etc/php/8.3/fpm/conf.d/99-php2shell-guard.ini' "$out"
+    has "scan: says only one CVE is named" 'php8.3-common: changelog names only one of the two CVEs' "$(docker exec p2sg-ubuntu bash /guard/guard.sh scan)"
+    docker exec p2sg-ubuntu mv /tmp/cl.orig $CL
     # pretend the package carries the fix, then that it does not
     docker exec p2sg-ubuntu sh -c "{ echo '  * Fix CVE-2026-109618 and CVE-2026-109619'; zcat $CL; } | gzip > /tmp/cl && mv /tmp/cl $CL"
     out=$(docker exec p2sg-ubuntu bash /guard/guard.sh fix --apply); rc=$?
